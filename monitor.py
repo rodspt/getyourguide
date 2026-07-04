@@ -29,6 +29,9 @@ logging.basicConfig(
 log = logging.getLogger("gyg-monitor")
 
 STATE_FILE = Path(os.getenv("STATE_FILE", "data/state.json"))
+DEBUG_DIR = STATE_FILE.parent / "debug"
+PAGE_LOAD_RETRIES = int(os.getenv("PAGE_LOAD_RETRIES", "3"))
+SELECTOR_TIMEOUT_MS = int(os.getenv("SELECTOR_TIMEOUT_MS", "90000"))
 
 MONTHS_PT = {
     1: "jan.",
@@ -293,13 +296,144 @@ def send_telegram(config: Config, message: str) -> None:
     )
 
 
-def read_input_titles(page) -> list[str]:
-    page.wait_for_selector("span.input-title", timeout=60000)
-    return [
-        text.strip()
-        for text in page.locator("span.input-title").all_inner_texts()
-        if text.strip()
+def accept_cookies(page) -> None:
+    selectors = [
+        "button:has-text('Accept all')",
+        "button:has-text('Aceitar todos')",
+        "button:has-text('Accept')",
+        "button:has-text('Aceitar')",
+        "[data-testid='uc-accept-all-button']",
+        "#uc-btn-accept-banner",
     ]
+    for selector in selectors:
+        try:
+            button = page.locator(selector).first
+            if button.is_visible(timeout=2500):
+                button.click(timeout=3000)
+                page.wait_for_timeout(1000)
+                log.info("Banner de cookies aceito")
+                return
+        except Exception:
+            continue
+
+
+def is_blocked_page(page) -> bool:
+    title = page.title().lower()
+    snippet = page.content()[:8000].lower()
+    markers = (
+        "getyourguide – error",
+        "getyourguide - error",
+        "access denied",
+        "captcha",
+        "challenge-platform",
+        "cf-browser-verification",
+        "unsupported",
+        "enable javascript",
+        "noscript",
+    )
+    return any(marker in title or marker in snippet for marker in markers)
+
+
+def log_page_diagnostics(page, label: str) -> None:
+    try:
+        title = page.title()
+        url = page.url
+        log.warning("Diagnóstico [%s] título=%r url=%s", label, title, url)
+        if is_blocked_page(page):
+            log.warning(
+                "Diagnóstico [%s]: página de bloqueio/erro detectada "
+                "(comum em VPS com IP de datacenter)",
+                label,
+            )
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        screenshot = DEBUG_DIR / f"{label}-{stamp}.png"
+        html_path = DEBUG_DIR / f"{label}-{stamp}.html"
+        page.screenshot(path=str(screenshot), full_page=True)
+        html_path.write_text(page.content(), encoding="utf-8")
+        log.warning("Diagnóstico salvo em %s e %s", screenshot, html_path)
+    except Exception as exc:
+        log.warning("Não foi possível salvar diagnóstico: %s", exc)
+
+
+def create_browser_context(playwright):
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ],
+    )
+    context = browser.new_context(
+        locale="pt-BR",
+        timezone_id="Europe/Zurich",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        extra_http_headers={
+            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+    )
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
+    return browser, context
+
+
+def load_activity_page(page, url: str) -> None:
+    last_error: Exception | None = None
+    for attempt in range(1, PAGE_LOAD_RETRIES + 1):
+        try:
+            log.info("Carregando página (tentativa %s/%s)", attempt, PAGE_LOAD_RETRIES)
+            page.goto(url, wait_until="domcontentloaded", timeout=90000)
+            accept_cookies(page)
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                page.wait_for_timeout(5000)
+            if is_blocked_page(page):
+                raise RuntimeError("GetYourGuide retornou página de erro ou bloqueio")
+            page.wait_for_selector("span.input-title", timeout=SELECTOR_TIMEOUT_MS)
+            return
+        except Exception as exc:
+            last_error = exc
+            log.warning("Falha ao carregar página: %s", exc)
+            log_page_diagnostics(page, f"load-{attempt}")
+            if attempt < PAGE_LOAD_RETRIES:
+                page.wait_for_timeout(5000)
+    raise RuntimeError(
+        f"Não foi possível carregar a página após {PAGE_LOAD_RETRIES} tentativas"
+    ) from last_error
+
+
+def read_input_titles(page) -> list[str]:
+    selectors = [
+        "span.input-title",
+        ".booking-assistant span.input-title",
+        "[class*='booking-assistant'] span.input-title",
+    ]
+    for selector in selectors:
+        try:
+            page.wait_for_selector(selector, timeout=SELECTOR_TIMEOUT_MS)
+            titles = [
+                text.strip()
+                for text in page.locator(selector).all_inner_texts()
+                if text.strip()
+            ]
+            if titles:
+                return titles
+        except Exception:
+            continue
+    log_page_diagnostics(page, "no-input-title")
+    raise RuntimeError(
+        "Elemento span.input-title não encontrado. "
+        "Verifique data/debug/ na VPS (screenshot e HTML)."
+    )
 
 
 def is_slot_available(titles: list[str], expected_label: str) -> bool:
@@ -473,22 +607,13 @@ def check_once(config: Config) -> None:
     log.info("Label esperado: %s", config.expected_label)
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        )
+        browser, context = create_browser_context(playwright)
         page = context.new_page()
         titles: list[str] = []
         available_times: list[str] = []
         preferred_time_available: bool | None = None
         try:
-            page.goto(check_url, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(4000)
+            load_activity_page(page, check_url)
             titles = read_input_titles(page)
             if is_slot_available(titles, config.expected_label):
                 available_times = read_available_times(page)

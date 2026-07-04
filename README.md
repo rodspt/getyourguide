@@ -161,3 +161,23 @@ Durante a operação normal, você verá mensagens como:
 - Depende da estrutura HTML atual do GetYourGuide; mudanças no site podem exigir ajustes nos seletores
 - O intervalo mínimo recomendado é de alguns minutos, para não sobrecarregar o site
 - Alertas repetidos enquanto a vaga existir são intencionais; aumente `CHECK_INTERVAL_SECONDS` se quiser menos mensagens
+
+## VPS / Docker
+
+Em servidores (VPS), o GetYourGuide pode bloquear IPs de datacenter ou demorar mais para renderizar a página. A aplicação inclui:
+
+- Retentativas de carregamento (`PAGE_LOAD_RETRIES`, padrão `3`)
+- Timeout maior para seletores (`SELECTOR_TIMEOUT_MS`, padrão `90000`)
+- Aceite automático de cookies
+- Flags `--no-sandbox` e `--disable-dev-shm-usage` no Chromium
+- `shm_size: 1gb` no `docker-compose.yml`
+- Diagnóstico em `data/debug/` (screenshot + HTML) quando falhar
+
+Se continuar falhando na VPS, inspecione `data/debug/` — se aparecer página de erro ou captcha, o IP do servidor provavelmente está bloqueado. Nesse caso, rodar localmente ou usar um proxy residencial pode ser necessário.
+
+Variáveis opcionais:
+
+| Variável               | Padrão | Descrição                          |
+|------------------------|--------|------------------------------------|
+| `PAGE_LOAD_RETRIES`    | `3`    | Tentativas de abrir a página       |
+| `SELECTOR_TIMEOUT_MS`  | `90000`| Timeout para `span.input-title` (ms)|

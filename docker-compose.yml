@@ -3,6 +3,8 @@ services:
     build: .
     container_name: gyg-monitor
     restart: unless-stopped
+    init: true
+    shm_size: "1gb"
     env_file:
       - .env
     volumes:
