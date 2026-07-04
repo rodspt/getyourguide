@@ -1,0 +1,10 @@
+.env
+data/
+__pycache__/
+*.pyc
+page.html
+*.js
+api1.json
+extract.js
+search-*.js
+find-*.js

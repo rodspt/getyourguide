@@ -1,0 +1,9 @@
+services:
+  gyg-monitor:
+    build: .
+    container_name: gyg-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
